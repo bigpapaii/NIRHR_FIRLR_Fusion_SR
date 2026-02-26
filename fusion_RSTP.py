@@ -2,6 +2,8 @@
 import time
 import threading
 import argparse
+from typing import Optional, Tuple
+
 import numpy as np
 import cv2
 
@@ -12,116 +14,20 @@ from gi.repository import Gst, GstRtspServer, GLib
 
 Gst.init(None)
 
-def ns():
+
+def gst_time_ns_from_sample(sample) -> int:
+    """
+    Return timestamp in ns for alignment.
+    Prefer GstBuffer PTS if available; otherwise fall back to monotonic time.
+    """
+    buf = sample.get_buffer()
+    pts = buf.pts
+    if pts is not None and pts != Gst.CLOCK_TIME_NONE:
+        return int(pts)
     return time.monotonic_ns()
 
-class FusionState:
-    def __init__(self, alpha: float, delta_ms: float):
-        self.alpha = float(alpha)
-        self.delta_ns = int(delta_ms * 1e6)
 
-        self.lock = threading.Lock()
-        self.last_th_frame = None          # np.ndarray BGR
-        self.last_th_ts = None             # ns
-
-        self.appsrc = None                # set when RTSP media created
-        self.out_w = None
-        self.out_h = None
-        self.out_fps = None
-
-    def update_thermal(self, frame_bgr: np.ndarray, ts_ns: int):
-        with self.lock:
-            self.last_th_frame = frame_bgr
-            self.last_th_ts = ts_ns
-
-    def fuse_and_push(self, gs_bgr: np.ndarray, gs_ts_ns: int):
-        with self.lock:
-            th = self.last_th_frame
-            th_ts = self.last_th_ts
-            appsrc = self.appsrc
-            out_w, out_h, out_fps = self.out_w, self.out_h, self.out_fps
-
-        if appsrc is None or out_w is None:
-            return  # no client yet
-
-        # resize GS to output size (normally out==gs size)
-        if gs_bgr.shape[1] != out_w or gs_bgr.shape[0] != out_h:
-            gs_bgr = cv2.resize(gs_bgr, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
-
-        if th is None:
-            fused = gs_bgr
-        else:
-            # hold last thermal if no new frame; use ±Δt only as "simultaneous" label (optional)
-            if th.shape[1] != out_w or th.shape[0] != out_h:
-                th2 = cv2.resize(th, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
-            else:
-                th2 = th
-
-            # linear blend
-            a = self.alpha
-            fused = cv2.addWeighted(gs_bgr, 1.0 - a, th2, a, 0.0)
-
-            # optional: if you want to visualize stale thermal
-            if th_ts is not None and abs(gs_ts_ns - th_ts) > self.delta_ns:
-                cv2.putText(fused, "TH STALE", (20, 40),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
-
-        # push to appsrc as BGR
-        data = fused.tobytes()
-        buf = Gst.Buffer.new_allocate(None, len(data), None)
-        buf.fill(0, data)
-
-        # timestamp: use monotonic-based running time; simplest is do-timestamp on appsrc,
-        # but you can also set buf.pts explicitly if you build a running-time mapping.
-        # (GstBuffer PTS is standard metadata.) :contentReference[oaicite:5]{index=5}
-
-        appsrc.emit("push-buffer", buf)
-
-class FusionFactory(GstRtspServer.RTSPMediaFactory):
-    def __init__(self, state: FusionState, width: int, height: int, fps: int, bitrate_kbps: int):
-        super().__init__()
-        self.state = state
-        self.width = width
-        self.height = height
-        self.fps = fps
-        self.bitrate_kbps = bitrate_kbps
-
-        launch = (
-            f"( appsrc name=fsrc is-live=true format=time do-timestamp=true "
-            f"caps=video/x-raw,format=BGR,width={width},height={height},framerate={fps}/1 "
-            f"! videoconvert ! video/x-raw,format=I420 "
-            f"! x264enc tune=zerolatency speed-preset=ultrafast bitrate={bitrate_kbps} key-int-max={fps} "
-            f"! h264parse config-interval=1 "
-            f"! rtph264pay name=pay0 pt=96 config-interval=1 )"
-        )
-        self.set_launch(launch)
-        self.set_shared(True)  # one pipeline shared by all clients :contentReference[oaicite:6]{index=6}
-
-    def do_configure(self, media):
-        # get appsrc and store into shared state
-        e = media.get_element()
-        appsrc = e.get_by_name("fsrc")
-        self.state.appsrc = appsrc
-        self.state.out_w = self.width
-        self.state.out_h = self.height
-        self.state.out_fps = self.fps
-
-def make_appsinks(gs_w, gs_h, gs_fps, th_dev):
-    # appsink: emit-signals must be true to get new-sample callbacks :contentReference[oaicite:7]{index=7}
-    gs_pipe = Gst.parse_launch(
-        f"libcamerasrc ! video/x-raw,width={gs_w},height={gs_h},framerate={gs_fps}/1,format=NV12 "
-        f"! videoconvert ! video/x-raw,format=BGR "
-        f"! appsink name=gssink emit-signals=true max-buffers=1 drop=true sync=false"
-    )
-    th_pipe = Gst.parse_launch(
-        f"v4l2src device={th_dev} do-timestamp=true "
-        f"! video/x-raw,format=RGB,width=160,height=120 "
-        f"! videoconvert ! video/x-raw,format=BGR "
-        f"! appsink name=thsink emit-signals=true max-buffers=1 drop=true sync=false"
-    )
-    return gs_pipe, th_pipe
-
-def sample_to_bgr(sample):
+def sample_to_bgr(sample) -> Optional[np.ndarray]:
     buf = sample.get_buffer()
     caps = sample.get_caps()
     s = caps.get_structure(0)
@@ -136,6 +42,215 @@ def sample_to_bgr(sample):
         return arr.copy()
     finally:
         buf.unmap(mapinfo)
+
+
+class FusionState:
+    """
+    latest_th_* : most recent thermal frame received (may not be "simultaneous")
+    held_th_*   : thermal frame that has been accepted as "simultaneous" with some GS frame (|dt|<=delta)
+                 This is the frame we keep/hold and blend into every GS frame until refreshed.
+    """
+    def __init__(self, alpha: float, delta_ms: float):
+        self.alpha = float(alpha)
+        self.delta_ns = int(delta_ms * 1e6)
+
+        self.lock = threading.Lock()
+
+        self.latest_th_frame: Optional[np.ndarray] = None
+        self.latest_th_ts: Optional[int] = None
+
+        self.held_th_frame: Optional[np.ndarray] = None
+        self.held_th_ts: Optional[int] = None
+
+        # appsrc is set when a client connects (media-configure)
+        self.appsrc = None
+        self.out_w: Optional[int] = None
+        self.out_h: Optional[int] = None
+        self.out_fps: Optional[int] = None
+
+        # pushing thread: keep only newest pending fused frame to avoid latency buildup
+        self._pending: Optional[Tuple[np.ndarray, int]] = None  # (frame_bgr, ts_ns)
+        self._pending_cv = threading.Condition()
+        self._running = True
+        self._push_thread = threading.Thread(target=self._push_loop, daemon=True)
+        self._push_thread.start()
+
+    def stop(self):
+        with self._pending_cv:
+            self._running = False
+            self._pending_cv.notify_all()
+        self._push_thread.join(timeout=2)
+
+    def set_appsrc(self, appsrc, out_w: int, out_h: int, out_fps: int):
+        with self.lock:
+            self.appsrc = appsrc
+            self.out_w = out_w
+            self.out_h = out_h
+            self.out_fps = out_fps
+
+    def clear_appsrc(self):
+        with self.lock:
+            self.appsrc = None
+
+    def update_thermal_latest(self, frame_bgr: np.ndarray, ts_ns: int):
+        with self.lock:
+            self.latest_th_frame = frame_bgr
+            self.latest_th_ts = ts_ns
+
+    def _maybe_refresh_held_thermal(self, gs_ts_ns: int):
+        """
+        Update held thermal only when latest thermal is within ±delta of current GS.
+        """
+        with self.lock:
+            if self.latest_th_frame is None or self.latest_th_ts is None:
+                return
+            if abs(gs_ts_ns - self.latest_th_ts) <= self.delta_ns:
+                self.held_th_frame = self.latest_th_frame
+                self.held_th_ts = self.latest_th_ts
+
+    def fuse_from_gs(self, gs_bgr: np.ndarray, gs_ts_ns: int):
+        """
+        Called for every GS frame:
+          - If latest thermal is within ±delta of this GS, refresh held thermal.
+          - Blend GS with held thermal (or GS alone if no held thermal yet).
+          - Enqueue fused frame for pushing to appsrc (drop older pending to keep low latency).
+        """
+        self._maybe_refresh_held_thermal(gs_ts_ns)
+
+        with self.lock:
+            held = self.held_th_frame
+            held_ts = self.held_th_ts
+            out_w, out_h = self.out_w, self.out_h
+
+        # no client yet
+        if out_w is None or out_h is None:
+            return
+
+        # resize GS -> output size
+        if gs_bgr.shape[1] != out_w or gs_bgr.shape[0] != out_h:
+            gs_bgr = cv2.resize(gs_bgr, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
+
+        if held is None:
+            fused = gs_bgr
+        else:
+            if held.shape[1] != out_w or held.shape[0] != out_h:
+                th2 = cv2.resize(held, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
+            else:
+                th2 = held
+
+            a = self.alpha
+            fused = cv2.addWeighted(gs_bgr, 1.0 - a, th2, a, 0.0)
+
+            # optional debug overlay: mark stale held thermal
+            if held_ts is not None and abs(gs_ts_ns - held_ts) > self.delta_ns:
+                cv2.putText(
+                    fused, "TH HOLD (STALE)",
+                    (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0,
+                    (0, 0, 255), 2
+                )
+
+        # enqueue newest fused frame; drop older pending to avoid latency accumulation
+        with self._pending_cv:
+            self._pending = (fused, gs_ts_ns)
+            self._pending_cv.notify()
+
+    def _push_loop(self):
+        """
+        Push fused frames into appsrc.
+        appsrc queues internally; we keep only newest pending to avoid buildup.
+        """
+        while True:
+            with self._pending_cv:
+                while self._running and self._pending is None:
+                    self._pending_cv.wait()
+                if not self._running:
+                    return
+                frame_bgr, ts_ns = self._pending
+                self._pending = None
+
+            with self.lock:
+                appsrc = self.appsrc
+                out_fps = self.out_fps
+
+            if appsrc is None or out_fps is None:
+                continue
+
+            data = frame_bgr.tobytes()
+            buf = Gst.Buffer.new_allocate(None, len(data), None)
+            buf.fill(0, data)
+
+            # Provide timestamps explicitly (format=time).
+            # We map gs_ts_ns (running-time ns) directly to PTS.
+            buf.pts = ts_ns
+            buf.dts = ts_ns
+            buf.duration = int(Gst.SECOND // out_fps)
+
+            # push-buffer can block if appsrc block=true; we set block=false & leaky-type=downstream in factory.
+            ret = appsrc.emit("push-buffer", buf)
+            if ret != Gst.FlowReturn.OK:
+                # client might have disconnected or downstream not accepting
+                pass
+
+
+class FusionFactory(GstRtspServer.RTSPMediaFactory):
+    def __init__(self, state: FusionState, width: int, height: int, fps: int, bitrate_kbps: int):
+        super().__init__()
+        self.state = state
+        self.width = width
+        self.height = height
+        self.fps = fps
+        self.bitrate_kbps = bitrate_kbps
+
+        # Low-latency appsrc:
+        # - block=false: don't stall producer thread
+        # - max-buffers / max-time: keep small queue
+        # - leaky-type=downstream: drop when full (avoid latency buildup)
+        # These behaviors are documented for appsrc.
+        launch = (
+            f"( appsrc name=fsrc is-live=true format=time do-timestamp=false "
+            f"block=false max-buffers=2 max-time=0 leaky-type=downstream "
+            f"caps=video/x-raw,format=BGR,width={width},height={height},framerate={fps}/1 "
+            f"! videoconvert ! video/x-raw,format=I420 "
+            f"! x264enc tune=zerolatency speed-preset=ultrafast bitrate={bitrate_kbps} key-int-max={fps} "
+            f"! h264parse config-interval=1 "
+            f"! rtph264pay name=pay0 pt=96 config-interval=1 )"
+        )
+        self.set_launch(launch)
+        self.set_shared(True)  # share one pipeline for all clients
+
+    def attach_media_callbacks(self):
+        # RTSPMediaFactory has media-configure signal for configuring per-media elements.
+        self.connect("media-configure", self._on_media_configure)
+
+    def _on_media_configure(self, factory, media):
+        element = media.get_element()
+        appsrc = element.get_by_name("fsrc")
+        if appsrc is None:
+            return
+
+        # When client disconnects, clear appsrc
+        media.connect("unprepared", lambda _m: self.state.clear_appsrc())
+
+        self.state.set_appsrc(appsrc, self.width, self.height, self.fps)
+
+
+def make_appsinks(gs_w, gs_h, gs_fps, th_dev):
+    # appsink: new-sample emitted only when emit-signals=true.
+    gs_pipe = Gst.parse_launch(
+        f"libcamerasrc ! video/x-raw,width={gs_w},height={gs_h},framerate={gs_fps}/1,format=NV12 "
+        f"! queue leaky=downstream max-size-buffers=1 "
+        f"! videoconvert ! video/x-raw,format=BGR "
+        f"! appsink name=gssink emit-signals=true max-buffers=1 drop=true sync=false"
+    )
+    th_pipe = Gst.parse_launch(
+        f"v4l2src device={th_dev} do-timestamp=true "
+        f"! video/x-raw,format=RGB,width=160,height=120 "
+        f"! queue leaky=downstream max-size-buffers=1 "
+        f"! videoconvert ! video/x-raw,format=BGR "
+        f"! appsink name=thsink emit-signals=true max-buffers=1 drop=true sync=false"
+    )
+    return gs_pipe, th_pipe
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -159,6 +274,7 @@ def main():
     mounts = server.get_mount_points()
 
     factory = FusionFactory(state, args.gs_w, args.gs_h, args.gs_fps, args.bitrate_kbps)
+    factory.attach_media_callbacks()
     mounts.add_factory(args.path, factory)
     server.attach(None)
 
@@ -171,14 +287,16 @@ def main():
         sample = sink.emit("pull-sample")
         frame = sample_to_bgr(sample)
         if frame is not None:
-            state.update_thermal(frame, ns())
+            ts = gst_time_ns_from_sample(sample)
+            state.update_thermal_latest(frame, ts)
         return Gst.FlowReturn.OK
 
     def on_gs_sample(sink):
         sample = sink.emit("pull-sample")
         frame = sample_to_bgr(sample)
         if frame is not None:
-            state.fuse_and_push(frame, ns())
+            ts = gst_time_ns_from_sample(sample)
+            state.fuse_from_gs(frame, ts)
         return Gst.FlowReturn.OK
 
     thsink.connect("new-sample", on_th_sample)
@@ -189,7 +307,13 @@ def main():
 
     print(f"Fusion RTSP: rtsp://<PI_IP>:{args.port}{args.path}")
     loop = GLib.MainLoop()
-    loop.run()
+    try:
+        loop.run()
+    finally:
+        state.stop()
+        th_pipe.set_state(Gst.State.NULL)
+        gs_pipe.set_state(Gst.State.NULL)
+
 
 if __name__ == "__main__":
     main()
