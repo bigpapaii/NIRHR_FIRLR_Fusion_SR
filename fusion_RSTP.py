@@ -325,11 +325,11 @@ class FusionFactory(GstRtspServer.RTSPMediaFactory):
 
 def make_appsinks(gs_w, gs_h, gs_fps, th_dev):
     gs_pipe = Gst.parse_launch(
-        f"libcamerasrc "
-        f"! video/x-raw,width={gs_w},height={gs_h},framerate={gs_fps}/1,format=NV12 "
-        f"! queue leaky=downstream max-size-buffers=1 "
-        f"! videoconvert ! video/x-raw,format=BGR "
-        f"! appsink name=gssink emit-signals=true max-buffers=1 drop=true sync=false"
+    f"libcamerasrc "
+    f"! video/x-raw,width={gs_w},height={gs_h},framerate={gs_fps}/1,format=NV12 "
+    f"! videobalance saturation=0.0 "  # 黑白
+    f"! videoconvert ! video/x-raw,format=BGR "
+    f"! appsink name=gssink emit-signals=true max-buffers=1 drop=true sync=false"
     )
     th_pipe = Gst.parse_launch(
         f"v4l2src device={th_dev} do-timestamp=true "
