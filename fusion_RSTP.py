@@ -55,14 +55,36 @@ def sample_to_bgr(sample) -> Optional[np.ndarray]:
         buf.unmap(mapinfo)
 
 
-def have_ximgproc() -> bool:
+def have_guided_filter() -> bool:
     return hasattr(cv2, "ximgproc") and hasattr(cv2.ximgproc, "guidedFilter")
 
 
+def have_joint_bilateral() -> bool:
+    return hasattr(cv2, "ximgproc") and hasattr(cv2.ximgproc, "jointBilateralFilter")
+
+
 def guided_refine(guide_gray_f: np.ndarray, src_f: np.ndarray, radius: int, eps: float) -> np.ndarray:
-    if have_ximgproc():
+    if have_guided_filter():
         return cv2.ximgproc.guidedFilter(guide_gray_f, src_f, radius, eps)
     return src_f
+
+
+def joint_bilateral_refine(
+    guide_u8: np.ndarray,
+    src_u8: np.ndarray,
+    d: int,
+    sigma_color: float,
+    sigma_space: float,
+) -> np.ndarray:
+    if have_joint_bilateral():
+        return cv2.ximgproc.jointBilateralFilter(
+            guide_u8,
+            src_u8,
+            d,
+            sigma_color,
+            sigma_space,
+        )
+    return src_u8
 
 
 def cmap_from_name(name: str) -> int:
@@ -88,9 +110,12 @@ class FusionState:
         p_high: float,
         colormap: int,
         blend_mode: str,
-        edge_aware: bool,
+        edge_mode: str,
         gf_radius: int,
         gf_eps: float,
+        jb_d: int,
+        jb_sigma_color: float,
+        jb_sigma_space: float,
     ):
         self.alpha = float(alpha)
         self.delta_ns = int(delta_ms * 1e6)
@@ -100,9 +125,14 @@ class FusionState:
         self.p_high = float(p_high)
         self.colormap = colormap
         self.blend_mode = blend_mode.lower()
-        self.edge_aware = bool(edge_aware)
+        self.edge_mode = edge_mode.lower()
+
         self.gf_radius = int(gf_radius)
         self.gf_eps = float(gf_eps)
+
+        self.jb_d = int(jb_d)
+        self.jb_sigma_color = float(jb_sigma_color)
+        self.jb_sigma_space = float(jb_sigma_space)
 
         self.lock = threading.Lock()
 
@@ -120,8 +150,13 @@ class FusionState:
         self._push_thread = threading.Thread(target=self._push_loop, daemon=True)
         self._push_thread.start()
 
-        if self.edge_aware and not have_ximgproc():
-            print("[WARN] edge-aware enabled but cv2.ximgproc.guidedFilter not found.")
+        if self.edge_mode == "guided" and not have_guided_filter():
+            print("[WARN] edge-mode=guided but cv2.ximgproc.guidedFilter not found. Falling back to none.")
+            self.edge_mode = "none"
+
+        if self.edge_mode == "joint-bilateral" and not have_joint_bilateral():
+            print("[WARN] edge-mode=joint-bilateral but cv2.ximgproc.jointBilateralFilter not found. Falling back to none.")
+            self.edge_mode = "none"
 
     def stop(self):
         with self._pending_cv:
@@ -145,11 +180,11 @@ class FusionState:
     def _build_thermal_entry(self, th_bgr: np.ndarray, ts_ns: int, out_w: Optional[int], out_h: Optional[int]):
         th_gray = cv2.cvtColor(th_bgr, cv2.COLOR_BGR2GRAY)
 
-        # low-res robust normalization first
         lo = np.percentile(th_gray, self.p_low)
         hi = np.percentile(th_gray, self.p_high)
         if hi <= lo + 1e-6:
             hi = lo + 1.0
+
         th_norm = np.clip((th_gray.astype(np.float32) - lo) / (hi - lo), 0.0, 1.0)
         th8_low = (th_norm * 255.0).astype(np.uint8)
 
@@ -159,7 +194,8 @@ class FusionState:
             "cached_size": None,
             "th8_up": None,
             "overlay_noedge": None,
-            "overlay_edge": None,
+            "overlay_guided": None,
+            "overlay_joint_bilateral": None,
         }
 
         if out_w is not None and out_h is not None:
@@ -173,12 +209,13 @@ class FusionState:
         if entry["cached_size"] == size and entry["th8_up"] is not None:
             return
 
-        # faster than cubic for latency
         th8_up = cv2.resize(entry["th8_low"], size, interpolation=cv2.INTER_LINEAR)
         entry["cached_size"] = size
         entry["th8_up"] = th8_up
+
         entry["overlay_noedge"] = None
-        entry["overlay_edge"] = None
+        entry["overlay_guided"] = None
+        entry["overlay_joint_bilateral"] = None
 
     def update_thermal(self, th_bgr: np.ndarray, ts_ns: int):
         with self.lock:
@@ -186,8 +223,7 @@ class FusionState:
             entry = self._build_thermal_entry(th_bgr, ts_ns, out_w, out_h)
             self.th_buf.append(entry)
 
-            # non-edge-aware path: pre-latch newest overlay immediately
-            if not self.edge_aware and entry["overlay_noedge"] is not None:
+            if self.edge_mode == "none" and entry["overlay_noedge"] is not None:
                 self.held_overlay = entry["overlay_noedge"]
                 self.held_ts = ts_ns
 
@@ -205,19 +241,38 @@ class FusionState:
     def _overlay_from_entry(self, entry, gs_bgr: np.ndarray, out_w: int, out_h: int) -> np.ndarray:
         self._ensure_entry_size(entry, out_w, out_h)
 
-        if not self.edge_aware:
+        if self.edge_mode == "none":
             if entry["overlay_noedge"] is None:
                 entry["overlay_noedge"] = cv2.applyColorMap(entry["th8_up"], self.colormap)
             return entry["overlay_noedge"]
 
-        if entry["overlay_edge"] is None:
-            guide = cv2.cvtColor(gs_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
-            src = entry["th8_up"].astype(np.float32) / 255.0
-            src_ref = guided_refine(guide, src, self.gf_radius, self.gf_eps)
-            th8_ref = np.clip(src_ref * 255.0, 0, 255).astype(np.uint8)
-            entry["overlay_edge"] = cv2.applyColorMap(th8_ref, self.colormap)
+        if self.edge_mode == "guided":
+            if entry["overlay_guided"] is None:
+                guide = cv2.cvtColor(gs_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+                src = entry["th8_up"].astype(np.float32) / 255.0
+                src_ref = guided_refine(guide, src, self.gf_radius, self.gf_eps)
+                th8_ref = np.clip(src_ref * 255.0, 0, 255).astype(np.uint8)
+                entry["overlay_guided"] = cv2.applyColorMap(th8_ref, self.colormap)
+            return entry["overlay_guided"]
 
-        return entry["overlay_edge"]
+        if self.edge_mode == "joint-bilateral":
+            if entry["overlay_joint_bilateral"] is None:
+                guide_u8 = cv2.cvtColor(gs_bgr, cv2.COLOR_BGR2GRAY)
+                src_u8 = entry["th8_up"]
+                th8_ref = joint_bilateral_refine(
+                    guide_u8,
+                    src_u8,
+                    self.jb_d,
+                    self.jb_sigma_color,
+                    self.jb_sigma_space,
+                )
+                th8_ref = np.clip(th8_ref, 0, 255).astype(np.uint8)
+                entry["overlay_joint_bilateral"] = cv2.applyColorMap(th8_ref, self.colormap)
+            return entry["overlay_joint_bilateral"]
+
+        if entry["overlay_noedge"] is None:
+            entry["overlay_noedge"] = cv2.applyColorMap(entry["th8_up"], self.colormap)
+        return entry["overlay_noedge"]
 
     def fuse_from_gs(self, gs_bgr: np.ndarray, gs_ts_ns: int):
         with self.lock:
@@ -366,9 +421,12 @@ def main():
     ap.add_argument("--colormap", type=str, default="inferno")
     ap.add_argument("--blend-mode", type=str, default="add", choices=["add", "mix"])
 
-    ap.add_argument("--edge-aware", action="store_true")
+    ap.add_argument("--edge-mode", type=str, default="none", choices=["none", "guided", "joint-bilateral"])
     ap.add_argument("--gf-radius", type=int, default=4)
     ap.add_argument("--gf-eps", type=float, default=1e-3)
+    ap.add_argument("--jb-d", type=int, default=5)
+    ap.add_argument("--jb-sigma-color", type=float, default=25.0)
+    ap.add_argument("--jb-sigma-space", type=float, default=7.0)
 
     ap.add_argument("--bitrate-kbps", type=int, default=4000)
     args = ap.parse_args()
@@ -381,9 +439,12 @@ def main():
         p_high=args.p_high,
         colormap=cmap_from_name(args.colormap),
         blend_mode=args.blend_mode,
-        edge_aware=args.edge_aware,
+        edge_mode=args.edge_mode,
         gf_radius=args.gf_radius,
         gf_eps=args.gf_eps,
+        jb_d=args.jb_d,
+        jb_sigma_color=args.jb_sigma_color,
+        jb_sigma_space=args.jb_sigma_space,
     )
 
     server = GstRtspServer.RTSPServer()
@@ -424,7 +485,9 @@ def main():
     gs_pipe.set_state(Gst.State.PLAYING)
 
     print(f"Fusion RTSP: rtsp://127.0.0.1:{args.port}{args.path}")
-    print(f"ximgproc available: {have_ximgproc()}")
+    print(f"guidedFilter available: {have_guided_filter()}")
+    print(f"jointBilateralFilter available: {have_joint_bilateral()}")
+    print(f"edge-mode: {state.edge_mode}")
 
     loop = GLib.MainLoop()
     try:
