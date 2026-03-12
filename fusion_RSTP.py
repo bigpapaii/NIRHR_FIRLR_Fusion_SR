@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import threading
 import argparse
-from typing import Optional, Tuple
+from typing import Optional
 from collections import deque
 
 import numpy as np
@@ -16,7 +16,6 @@ Gst.init(None)
 
 
 def now_ns() -> int:
-    # monotonic time suitable for delta measurement
     return int(Gst.util_get_timestamp())
 
 
@@ -50,7 +49,6 @@ def sample_to_bgr(sample) -> Optional[np.ndarray]:
     if not ok:
         return None
     try:
-        # assumes packed BGR
         arr = np.frombuffer(mapinfo.data, dtype=np.uint8).reshape((h, w, 3))
         return arr.copy()
     finally:
@@ -58,29 +56,13 @@ def sample_to_bgr(sample) -> Optional[np.ndarray]:
 
 
 def have_ximgproc() -> bool:
-    return hasattr(cv2, "ximgproc") and (
-        hasattr(cv2.ximgproc, "guidedFilter") or hasattr(cv2.ximgproc, "jointBilateralFilter")
-    )
+    return hasattr(cv2, "ximgproc") and hasattr(cv2.ximgproc, "guidedFilter")
 
 
 def guided_refine(guide_gray_f: np.ndarray, src_f: np.ndarray, radius: int, eps: float) -> np.ndarray:
-    """
-    Edge-aware refinement (same size arrays), prefer guidedFilter if available.
-    OpenCV guidedFilter signature documented in ximgproc. :contentReference[oaicite:1]{index=1}
-    """
-    if hasattr(cv2, "ximgproc") and hasattr(cv2.ximgproc, "guidedFilter"):
+    if have_ximgproc():
         return cv2.ximgproc.guidedFilter(guide_gray_f, src_f, radius, eps)
-    # fallback: no-op
     return src_f
-
-
-def joint_bilateral_refine(guide_u8: np.ndarray, src_u8: np.ndarray, d: int, sigmaColor: float, sigmaSpace: float) -> np.ndarray:
-    """
-    Joint bilateral filter (uses guide as joint image). Documented by OpenCV ximgproc. :contentReference[oaicite:2]{index=2}
-    """
-    if hasattr(cv2, "ximgproc") and hasattr(cv2.ximgproc, "jointBilateralFilter"):
-        return cv2.ximgproc.jointBilateralFilter(guide_u8, src_u8, d, sigmaColor, sigmaSpace)
-    return src_u8
 
 
 def cmap_from_name(name: str) -> int:
@@ -124,17 +106,14 @@ class FusionState:
 
         self.lock = threading.Lock()
 
-        # latched thermal overlay prepared at output size (BGR uint8)
         self.held_overlay: Optional[np.ndarray] = None
         self.held_ts: Optional[int] = None
 
-        # RTSP appsrc
         self.appsrc = None
         self.out_w: Optional[int] = None
         self.out_h: Optional[int] = None
         self.out_fps: Optional[int] = None
 
-        # push thread
         self._pending: Optional[np.ndarray] = None
         self._pending_cv = threading.Condition()
         self._running = True
@@ -142,7 +121,7 @@ class FusionState:
         self._push_thread.start()
 
         if self.edge_aware and not have_ximgproc():
-            print("[WARN] edge-aware enabled but cv2.ximgproc not found. Install opencv-contrib-python or disable --edge-aware.")
+            print("[WARN] edge-aware enabled but cv2.ximgproc.guidedFilter not found.")
 
     def stop(self):
         with self._pending_cv:
@@ -163,92 +142,115 @@ class FusionState:
             self.appsrc = None
         print("[RTSP] appsrc cleared")
 
+    def _build_thermal_entry(self, th_bgr: np.ndarray, ts_ns: int, out_w: Optional[int], out_h: Optional[int]):
+        th_gray = cv2.cvtColor(th_bgr, cv2.COLOR_BGR2GRAY)
+
+        # low-res robust normalization first
+        lo = np.percentile(th_gray, self.p_low)
+        hi = np.percentile(th_gray, self.p_high)
+        if hi <= lo + 1e-6:
+            hi = lo + 1.0
+        th_norm = np.clip((th_gray.astype(np.float32) - lo) / (hi - lo), 0.0, 1.0)
+        th8_low = (th_norm * 255.0).astype(np.uint8)
+
+        entry = {
+            "ts": ts_ns,
+            "th8_low": th8_low,
+            "cached_size": None,
+            "th8_up": None,
+            "overlay_noedge": None,
+            "overlay_edge": None,
+        }
+
+        if out_w is not None and out_h is not None:
+            self._ensure_entry_size(entry, out_w, out_h)
+            entry["overlay_noedge"] = cv2.applyColorMap(entry["th8_up"], self.colormap)
+
+        return entry
+
+    def _ensure_entry_size(self, entry, out_w: int, out_h: int):
+        size = (out_w, out_h)
+        if entry["cached_size"] == size and entry["th8_up"] is not None:
+            return
+
+        # faster than cubic for latency
+        th8_up = cv2.resize(entry["th8_low"], size, interpolation=cv2.INTER_LINEAR)
+        entry["cached_size"] = size
+        entry["th8_up"] = th8_up
+        entry["overlay_noedge"] = None
+        entry["overlay_edge"] = None
+
     def update_thermal(self, th_bgr: np.ndarray, ts_ns: int):
         with self.lock:
-            self.th_buf.append((ts_ns, th_bgr))
+            out_w, out_h = self.out_w, self.out_h
+            entry = self._build_thermal_entry(th_bgr, ts_ns, out_w, out_h)
+            self.th_buf.append(entry)
 
-    def _pick_nearest_thermal(self, gs_ts_ns: int) -> Optional[Tuple[int, np.ndarray, int]]:
-        """
-        Return (dt_ns, frame_ts, frame_bgr) for nearest thermal in buffer.
-        """
+            # non-edge-aware path: pre-latch newest overlay immediately
+            if not self.edge_aware and entry["overlay_noedge"] is not None:
+                self.held_overlay = entry["overlay_noedge"]
+                self.held_ts = ts_ns
+
+    def _pick_nearest_thermal_entry(self, gs_ts_ns: int):
         with self.lock:
             if not self.th_buf:
                 return None
             best = None
-            for tts, frame in self.th_buf:
-                dt = abs(gs_ts_ns - tts)
+            for entry in self.th_buf:
+                dt = abs(gs_ts_ns - entry["ts"])
                 if best is None or dt < best[0]:
-                    best = (dt, tts, frame)
+                    best = (dt, entry)
             return best
 
-    def _prepare_overlay(self, gs_bgr: np.ndarray, th_bgr: np.ndarray) -> np.ndarray:
-        """
-        Build thermal heatmap overlay at output size, optionally edge-aware guided by GS.
-        """
-        out_w, out_h = gs_bgr.shape[1], gs_bgr.shape[0]
+    def _overlay_from_entry(self, entry, gs_bgr: np.ndarray, out_w: int, out_h: int) -> np.ndarray:
+        self._ensure_entry_size(entry, out_w, out_h)
 
-        # thermal -> gray
-        th_gray = cv2.cvtColor(th_bgr, cv2.COLOR_BGR2GRAY)
+        if not self.edge_aware:
+            if entry["overlay_noedge"] is None:
+                entry["overlay_noedge"] = cv2.applyColorMap(entry["th8_up"], self.colormap)
+            return entry["overlay_noedge"]
 
-        # upsample to output size (use better interpolator than linear)
-        th_up = cv2.resize(th_gray, (out_w, out_h), interpolation=cv2.INTER_CUBIC)
-
-        # optional edge-aware refinement: guidedFilter on float32 guide/src
-        if self.edge_aware and have_ximgproc():
+        if entry["overlay_edge"] is None:
             guide = cv2.cvtColor(gs_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
-            src = th_up.astype(np.float32) / 255.0
+            src = entry["th8_up"].astype(np.float32) / 255.0
             src_ref = guided_refine(guide, src, self.gf_radius, self.gf_eps)
-            th_up = np.clip(src_ref * 255.0, 0, 255).astype(np.uint8)
+            th8_ref = np.clip(src_ref * 255.0, 0, 255).astype(np.uint8)
+            entry["overlay_edge"] = cv2.applyColorMap(th8_ref, self.colormap)
 
-        # robust normalize using percentiles
-        lo = np.percentile(th_up, self.p_low)
-        hi = np.percentile(th_up, self.p_high)
-        if hi <= lo + 1e-6:
-            hi = lo + 1.0
-        th_norm = np.clip((th_up.astype(np.float32) - lo) / (hi - lo), 0.0, 1.0)
-        th8 = (th_norm * 255.0).astype(np.uint8)
-
-        # colorize
-        th_color = cv2.applyColorMap(th8, self.colormap)
-        return th_color
+        return entry["overlay_edge"]
 
     def fuse_from_gs(self, gs_bgr: np.ndarray, gs_ts_ns: int):
         with self.lock:
             out_w, out_h = self.out_w, self.out_h
+            held_overlay = self.held_overlay
+            held_ts = self.held_ts
 
         if out_w is None or out_h is None:
-            return  # no client yet
+            return
 
-        # resize GS to output size (usually already)
         if gs_bgr.shape[1] != out_w or gs_bgr.shape[0] != out_h:
             gs_bgr = cv2.resize(gs_bgr, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
 
-        # update held overlay only if nearest thermal is within delta
-        pick = self._pick_nearest_thermal(gs_ts_ns)
+        pick = self._pick_nearest_thermal_entry(gs_ts_ns)
         if pick is not None:
-            dt, th_ts, th_frame = pick
-            if dt <= self.delta_ns:
-                overlay = self._prepare_overlay(gs_bgr, th_frame)
+            dt, entry = pick
+            if dt <= self.delta_ns and entry["ts"] != held_ts:
+                overlay = self._overlay_from_entry(entry, gs_bgr, out_w, out_h)
                 with self.lock:
                     self.held_overlay = overlay
-                    self.held_ts = th_ts
+                    self.held_ts = entry["ts"]
+                    held_overlay = overlay
+                    held_ts = entry["ts"]
 
-        with self.lock:
-            overlay = self.held_overlay
-            held_ts = self.held_ts
-
-        if overlay is None:
+        if held_overlay is None:
             fused = gs_bgr
         else:
-            a = float(self.alpha)
+            a = self.alpha
             if self.blend_mode == "add":
-                # additive overlay (often better for heatmaps)
-                fused = cv2.addWeighted(gs_bgr, 1.0, overlay, a, 0.0)
+                fused = cv2.addWeighted(gs_bgr, 1.0, held_overlay, a, 0.0)
             else:
-                # standard mix
-                fused = cv2.addWeighted(gs_bgr, 1.0 - a, overlay, a, 0.0)
+                fused = cv2.addWeighted(gs_bgr, 1.0 - a, held_overlay, a, 0.0)
 
-            # debug: show dt on image (optional)
             if held_ts is not None:
                 dt_ms = abs(gs_ts_ns - held_ts) / 1e6
                 cv2.putText(
@@ -281,10 +283,7 @@ class FusionState:
             data = frame_bgr.tobytes()
             buf = Gst.Buffer.new_allocate(None, len(data), None)
             buf.fill(0, data)
-
-            # do-timestamp=true on appsrc => do not set pts/dts
             buf.duration = int(Gst.SECOND // out_fps)
-
             _ = appsrc.emit("push-buffer", buf)
 
 
@@ -303,7 +302,7 @@ class FusionFactory(GstRtspServer.RTSPMediaFactory):
             f"caps=video/x-raw,format=BGR,width={width},height={height},framerate={fps}/1 "
             f"! queue leaky=downstream max-size-buffers=2 "
             f"! videoconvert ! video/x-raw,format=I420 "
-            f"! x264enc tune=zerolatency speed-preset=ultrafast bitrate={bitrate_kbps} key-int-max={fps} "
+            f"! x264enc tune=zerolatency speed-preset=ultrafast bitrate={bitrate_kbps} key-int-max=15 "
             f"! h264parse config-interval=1 "
             f"! rtph264pay name=pay0 pt=96 config-interval=1 )"
         )
@@ -319,18 +318,27 @@ class FusionFactory(GstRtspServer.RTSPMediaFactory):
         if appsrc is None:
             print("[RTSP][ERROR] failed to get appsrc")
             return
+
         media.connect("unprepared", lambda _m: self.state.clear_appsrc())
+
+        try:
+            appsrc.set_property("min-latency", 0)
+        except Exception:
+            pass
+
         self.state.set_appsrc(appsrc, self.width, self.height, self.fps)
 
 
 def make_appsinks(gs_w, gs_h, gs_fps, th_dev):
     gs_pipe = Gst.parse_launch(
-    f"libcamerasrc "
-    f"! video/x-raw,width={gs_w},height={gs_h},framerate={gs_fps}/1,format=NV12 "
-    f"! videobalance saturation=0.0 "  # 黑白
-    f"! videoconvert ! video/x-raw,format=BGR "
-    f"! appsink name=gssink emit-signals=true max-buffers=1 drop=true sync=false"
+        f"libcamerasrc "
+        f"! video/x-raw,width={gs_w},height={gs_h},framerate={gs_fps}/1,format=NV12 "
+        f"! videobalance saturation=0.0 "
+        f"! queue leaky=downstream max-size-buffers=1 "
+        f"! videoconvert ! video/x-raw,format=BGR "
+        f"! appsink name=gssink emit-signals=true max-buffers=1 drop=true sync=false"
     )
+
     th_pipe = Gst.parse_launch(
         f"v4l2src device={th_dev} do-timestamp=true "
         f"! video/x-raw,format=RGB,width=160,height=120 "
@@ -351,7 +359,7 @@ def main():
     ap.add_argument("--th-dev", type=str, default="/dev/video42")
 
     ap.add_argument("--alpha", type=float, default=0.35)
-    ap.add_argument("--delta-ms", type=float, default=80.0)
+    ap.add_argument("--delta-ms", type=float, default=40.0)
     ap.add_argument("--th-buf-len", type=int, default=16)
     ap.add_argument("--p-low", type=float, default=2.0)
     ap.add_argument("--p-high", type=float, default=98.0)
@@ -359,7 +367,7 @@ def main():
     ap.add_argument("--blend-mode", type=str, default="add", choices=["add", "mix"])
 
     ap.add_argument("--edge-aware", action="store_true")
-    ap.add_argument("--gf-radius", type=int, default=8)
+    ap.add_argument("--gf-radius", type=int, default=4)
     ap.add_argument("--gf-eps", type=float, default=1e-3)
 
     ap.add_argument("--bitrate-kbps", type=int, default=4000)
@@ -378,7 +386,6 @@ def main():
         gf_eps=args.gf_eps,
     )
 
-    # RTSP server
     server = GstRtspServer.RTSPServer()
     server.props.address = "0.0.0.0"
     server.props.service = str(args.port)
@@ -389,7 +396,6 @@ def main():
     mounts.add_factory(args.path, factory)
     server.attach(None)
 
-    # capture pipelines -> appsinks
     gs_pipe, th_pipe = make_appsinks(args.gs_w, args.gs_h, args.gs_fps, args.th_dev)
     attach_bus_logger(gs_pipe, "GS")
     attach_bus_logger(th_pipe, "TH")
@@ -418,7 +424,7 @@ def main():
     gs_pipe.set_state(Gst.State.PLAYING)
 
     print(f"Fusion RTSP: rtsp://127.0.0.1:{args.port}{args.path}")
-    print(f"ximgproc available: {have_ximgproc()} (guided/joint bilateral need OpenCV contrib)")
+    print(f"ximgproc available: {have_ximgproc()}")
 
     loop = GLib.MainLoop()
     try:
