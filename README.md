@@ -1,6 +1,6 @@
 # NIRHR_FIRLR_Fusion_SR
 
-![FIR-NIR Fusion Demo](assets/fusion_demo.jpg)
+![FIR-NIR Fusion Demo](Assets/fusion_demo.jpg)
 
 > Real-time FIR + NIR fusion RTSP demo for Raspberry Pi: grayscale global-shutter stream + thermal stream alignment, fusion, and network publishing.
 >
