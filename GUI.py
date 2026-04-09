@@ -234,9 +234,6 @@ class FusionGUI:
     def capture_photo(self):
         if not self._ensure_power():
             return
-        if self.current_view not in ("FIR", "NIR"):
-            self.log("Capture Photo is for FIR or NIR views. Select FIR or NIR.")
-            return
         if self.cap is None:
             self.log("No live stream active — cannot capture.")
             return
